@@ -1,0 +1,7 @@
+defaultProject: alessandro-provenza-sandbox
+defaultLocation: EU
+defaultDataset: multiregion_eu
+defaultAssertionDataset: dataform_assertions
+dataformCoreVersion: 3.0.0
+vars:
+    spreadsheetId: ""

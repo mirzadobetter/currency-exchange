@@ -1,0 +1,24 @@
+config {
+  type: "view",
+  disabled: false,
+  dependencies: [],
+  tags: ["currency-exchange"],
+  schema: "commons",
+  name: "currency_exchange",
+  description: schemas.commons.currency_exchange.description,
+  columns: {
+    ...schemas.commons.currency_exchange.columns
+  }
+}
+
+SELECT
+  date,
+  currency_from,
+  currency_to,
+  COALESCE(
+      curr.rate,
+      hist.rate
+  ) AS rate
+FROM ${ref('curated', 'currency_exchange_history')} AS hist
+LEFT JOIN ${ref('landing', 'currency_exchange_current')} AS curr
+  USING (date, currency_from, currency_to)

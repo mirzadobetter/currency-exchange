@@ -1,0 +1,89 @@
+config {
+  type: "incremental",
+  disabled: false,
+  dependencies: [],
+  tags: ["currency-exchange"],
+  schema: "curated",
+  name: "currency_exchange_history",
+  description: schemas.commons.currency_exchange_history.description,
+  columns: {
+    ...schemas.commons.currency_exchange_history.columns
+  },
+  uniqueKey: ["date", "currency_from", "currency_to"],
+  bigquery: {
+    clusterBy: ["date", "currency_from", "currency_to"]
+  }
+}
+
+SELECT
+  date,
+  currency_from,
+  currency_to,
+  rate
+FROM GAP_FILL(
+  (SELECT * FROM ${ref('landing', 'currency_exchange_history')} WHERE date IS NOT NULL),
+  ts_column => 'date',
+  bucket_width => INTERVAL 1 DAY,
+  partitioning_columns => [
+    'currency_from',
+    'currency_to'
+  ],
+  value_columns => [
+    ('rate', 'locf')
+  ]
+)
+
+post_operations {
+  CREATE OR REPLACE TEMPORARY TABLE tmp_${name()} AS (
+    WITH last_dates AS (
+      SELECT
+        MAX(date) AS date,
+        currency_from,
+        currency_to,
+      FROM ${self()}
+      GROUP BY ALL
+    )
+
+    , generate_missing_dates AS (
+      SELECT
+        cal.date,
+        currency_from,
+        currency_to,
+      FROM ${ref('commons', 'calendar')} AS cal
+      CROSS JOIN last_dates
+      WHERE 1=1
+        AND cal.date BETWEEN (SELECT LEAST(MIN(date), CURRENT_DATE()-1) FROM last_dates) AND CURRENT_DATE()
+    )
+
+    , final AS (
+      SELECT
+        generate_missing_dates.date,
+        generate_missing_dates.currency_from,
+        generate_missing_dates.currency_to,
+        COALESCE(
+          prev.rate,
+          LAST_VALUE(base.rate IGNORE NULLS) OVER (
+            PARTITION BY currency_from, currency_to 
+            ORDER BY date ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          )
+        ) AS rate,
+      FROM generate_missing_dates
+      LEFT JOIN ${self()} AS base
+        USING (date, currency_from, currency_to)
+      LEFT JOIN ${ref('landing', 'currency_exchange_previous_day')} AS prev
+        USING (date, currency_from, currency_to)
+    )
+
+    SELECT * FROM final
+  );
+
+  MERGE ${self()} AS T
+  USING tmp_${name()} AS S
+    ON T.date = S.date
+    AND T.currency_from = S.currency_from
+    AND T.currency_to = S.currency_to
+  WHEN MATCHED THEN
+    UPDATE SET T.rate = S.rate
+  WHEN NOT MATCHED THEN
+    INSERT ROW;
+}

@@ -1,0 +1,14 @@
+config {
+  type: "view",
+  disabled: false,
+  dependencies: [],
+  tags: ["currency-exchange"],
+  schema: "commons",
+  name: "calendar",
+  description: "Calendar dimension.",
+}
+
+
+SELECT 
+  date
+FROM UNNEST(GENERATE_DATE_ARRAY('2010-01-01', '2099-12-31', INTERVAL 1 DAY)) AS date

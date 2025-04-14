@@ -1,0 +1,805 @@
+main:
+    params: [args]
+    steps:
+        - init:
+            # Initialize variables from input arguments, environment variables, and default values.
+            # These variables are used throughout the workflow for configuration and execution.
+            assign:
+                # Params variables
+                - fullRefresh: ${default(map.get(args, ["fullRefresh"]), false)}
+                - recreateSpreadsheet: ${default(map.get(args, ["recreateSpreadsheet"]), false)}
+                - defaultStartDate: ${default(map.get(args, ["defaultStartDate"]), "2015-01-01")}
+                # Environment variables
+                - projectId: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+                - projectNumber: ${sys.get_env("GOOGLE_CLOUD_PROJECT_NUMBER")}
+                - workflowExecutionId: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+                - serviceAccount: ${text.split(sys.get_env("GOOGLE_CLOUD_SERVICE_ACCOUNT_NAME"), "/")[len(text.split(sys.get_env("GOOGLE_CLOUD_SERVICE_ACCOUNT_NAME"), "/")) - 1]}
+                # Architecture variables
+                - firestoreBaseUrl: ${"projects/" + projectId + "/databases/currency-exchange"}
+                - dataformBaseUrl: https://dataform.googleapis.com/v1beta1/
+                - dataformRepositoryUrl: ${"projects/" + projectId + "/locations/europe-west8/repositories/currency-exchange"}
+                - dataformWorkflowTag: "currency-exchange"
+                # Operational variables
+                - sheetHiddenHistoryId: 0
+                - sheetHiddenHistoryName: HIDDEN_RATES_HISTORY
+                - sheetHistoryId: 0
+                - sheetHistoryName: RATES_HISTORY
+                - sheetPreviousDayId: 0
+                - sheetPreviousDayName: PREV_DAY_RATES
+                - sheetCurrentDayId: 0
+                - sheetCurrentDayName: CURRENT_RATES
+                - previousRates: []
+                - currentRates: []
+        
+        - checks:
+            # Perform checks to determine if the workflow should execute a full refresh or proceed normally.
+            # Logs the mode of execution (e.g., FULL REFRESH).
+            steps:
+                - checks_fullRefreshCheck:
+                    # Check if the workflow should execute a full refresh of the currency exchange history
+                    switch:
+                        - condition: ${fullRefresh}
+                          steps:
+                            - fullRefreshCheck_log:
+                                call: sys.log
+                                args:
+                                    data: ${"Workflow has been invoked in FULL REFRESH mode"}
+                                    severity: "INFO"
+                # - checks_recreateSpreadsheet:
+
+        - getOrCreateSpreadsheet:
+            # Retrieve an existing spreadsheet ID from Firestore or create a new one.
+            # If recreateSpreadsheet is true, delete the old spreadsheet and create a new one.
+            # Grant public read access to the spreadsheet and save its ID in Firestore.
+            steps:
+                - getOrCreateSpreadsheet_getSpreadsheetId:
+                    call: googleapis.firestore.v1.projects.databases.documents.get
+                    args:
+                        name: ${firestoreBaseUrl + "/documents/configurations/wf-currency-exchange"}
+                    result: configurations
+                
+                - getOrCreateSpreadsheet_checkSpreadsheetId:
+                    # Checking spreadsheet id:
+                    #   - if recreateSpreadsheet is true, deleting old spreadsheet and creating a new one
+                    #   - if spreadsheetId in Firestore, using that to execute workflow
+                    #   - if spreadsheetId not in Firestore, creating a new one
+                    switch:
+                        - condition: ${recreateSpreadsheet}
+                          steps:
+                            - getOrCreateSpreadsheet_checkSpreadsheetId_logrecreateSpreadsheet:
+                                call: sys.log
+                                args:
+                                    data: ${"Starting spreadsheet full refresh"}
+                                    severity: "INFO"
+                                next: getOrCreateSpreadsheet_deleteOldSpreadsheet
+                                
+                        - condition: ${default(map.get(configurations, ["fields",  "master_spreadsheet_id", "stringValue"]), "") != ""}
+                          steps:
+                            - getOrCreateSpreadsheet_checkSpreadsheetId_assignSpreadsheetId:
+                                assign:
+                                    - spreadsheetId: ${map.get(configurations, ["fields",  "master_spreadsheet_id", "stringValue"])}
+                            
+                            - getOrCreateSpreadsheet_checkSpreadsheetId_logExistingSpreadsheet:
+                                call: sys.log
+                                args:
+                                    data: ${"Spreadsheet https://docs.google.com/spreadsheets/d/" + spreadsheetId + "/edit?usp=sharing already created, going on with its initialization"}
+                                    severity: "INFO"
+                                next: initializeHistorySheets
+                        
+                        - condition: ${default(map.get(configurations, ["fields",  "master_spreadsheet_id", "stringValue"]), "") == ""}
+                          steps:
+                            - getOrCreateSpreadsheet_checkSpreadsheetId_logNoExistingSpreadsheet:
+                                call: sys.log
+                                args:
+                                    data: ${"No existing spreadsheet found, creating a new one"}
+                                    severity: "INFO"
+                                next: getOrCreateSpreadsheet_createSpreadsheet
+                
+                - getOrCreateSpreadsheet_deleteOldSpreadsheet:
+                    steps:
+                        - getOrCreateSpreadsheet_deleteOldSpreadsheet_getAccessToken:
+                            # Getting access token for the service account
+                            call: http.post
+                            args:
+                                url: ${"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/" + serviceAccount + ":generateAccessToken"}
+                                auth:
+                                    type: OAuth2
+                                body:
+                                    delegates: ${[]}
+                                    scope:
+                                        - "https://www.googleapis.com/auth/drive"
+                                    lifetime: "60s"
+                            result: accessTokenResponse
+                        
+                        - getOrCreateSpreadsheet_deleteOldSpreadsheet_delete:
+                            try:
+                                call: http.delete
+                                args:
+                                    url: ${"https://www.googleapis.com/drive/v3/files/" + default(map.get(configurations, ["fields",  "master_spreadsheet_id", "stringValue"]), "")}
+                                    headers:
+                                        Authorization: ${"Bearer " + accessTokenResponse.body.accessToken}
+                                        Content-Type: "application/json"
+                                result: permissionResponse
+                            except:
+                                as: error
+                
+                - getOrCreateSpreadsheet_createSpreadsheet:
+                    # Creating spreadsheet with 4 sheets to handle hidden history, presentation history, previous and current day
+                    try:
+                        call: googleapis.sheets.v4.spreadsheets.create
+                        args:
+                            body:
+                                properties:
+                                    title: "Currency Exchange History"
+                                sheets:
+                                    - properties:
+                                        title: ${sheetHiddenHistoryName}
+                                    - properties:
+                                        title: ${sheetHistoryName}
+                                    - properties:
+                                        title: ${sheetPreviousDayName}
+                                    - properties:
+                                        title: ${sheetCurrentDayName}
+                        result: spreadsheet
+                    except:
+                        as: error
+                        raise: ${error}
+                
+                - getOrCreateSpreadsheet_assignSpreadsheetId:
+                    assign:
+                        - spreadsheetId: ${spreadsheet.spreadsheetId}
+                
+                - getOrCreateSpreadsheet_logSpreadsheetId:
+                    call: sys.log
+                    args:
+                        data: ${"Successfully created spreadsheet https://docs.google.com/spreadsheets/d/" + spreadsheetId + "/edit?usp=sharing owned by service account " + serviceAccount}
+                        severity: "INFO"
+                
+                - getOrCreateSpreadsheet_saveSpreadsheetId:
+                    # Updating spreadsheetid in Firestore
+                    call: googleapis.firestore.v1.projects.databases.documents.patch
+                    args:
+                        name: ${firestoreBaseUrl + "/documents/configurations/wf-currency-exchange"}
+                        updateMask:
+                            fieldPaths: ["master_spreadsheet_id"]
+                        body:
+                            fields:
+                                master_spreadsheet_id:
+                                    stringValue: ${spreadsheetId}
+                
+                - getOrCreateSpreadsheet_logUpdatedSpreadsheetFirestore:
+                    call: sys.log
+                    args:
+                        data: ${"Successfully updated configuration master_spreadsheet_id in Firestore"}
+                        severity: "INFO"
+                
+                - getOrCreateSpreadsheet_getAccessToken:
+                    # Getting access token for the service account
+                    call: http.post
+                    args:
+                        url: ${"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/" + serviceAccount + ":generateAccessToken"}
+                        auth:
+                            type: OAuth2
+                        body:
+                            delegates: ${[]}
+                            scope:
+                                - "https://www.googleapis.com/auth/drive"
+                            lifetime: "60s"
+                    result: accessTokenResponse
+                
+                - getOrCreateSpreadsheet_grantReaderRole:
+                    # Granting anyone read access on the document
+                    call: http.post
+                    args:
+                        url: ${"https://www.googleapis.com/drive/v3/files/" + spreadsheetId + "/permissions"}
+                        headers:
+                            Authorization: ${"Bearer " + accessTokenResponse.body.accessToken}
+                            Content-Type: "application/json"
+                        body:
+                            role: "reader"
+                            type: "anyone"
+                    result: permissionResponse
+                
+                - getOrCreateSpreadsheet_logPermissionGranted:
+                    call: sys.log
+                    args:
+                        data: ${"Read permission on spreadsheet assigned to anyone"}
+                        severity: "INFO"
+
+        - initializeHistorySheets:
+            # Initialize the spreadsheet by clearing existing data and ensuring required sheets exist.
+            # Logs errors and stops the workflow if any required sheet is missing.
+            steps:
+                - initializeHistorySheets_logInit:
+                    call: sys.log
+                    args:
+                        data: ${"Starting history sheets initialization..."}
+                        severity: "INFO"
+
+                - initializeHistorySheets_clearSheets:
+                    call: googleapis.sheets.v4.spreadsheets.values.batchClear
+                    args:
+                        spreadsheetId: ${spreadsheetId}
+                        body:
+                            ranges: ${[sheetHiddenHistoryName + "!A:D", sheetHistoryName + "!A:D"]}
+
+                - initializeHistorySheets_getUpdatedSpreadsheet:
+                    call: googleapis.sheets.v4.spreadsheets.get
+                    args:
+                        spreadsheetId: ${spreadsheetId}
+                    result: spreadsheet
+
+                - initializeHistorySheets_findSheetsIds:
+                    # Looping over all sheets to get their ids
+                    for:
+                        value: sheet
+                        in: ${spreadsheet.sheets}
+                        steps:
+                            - initializeHistorySheets_findSheetsIds_assignIds:
+                                assign:
+                                    - sheetHiddenHistoryId: ${if(map.get(sheet, ["properties", "title"]) == sheetHiddenHistoryName, sheet.properties.sheetId, sheetHiddenHistoryId)}
+                                    - sheetHistoryId: ${if(map.get(sheet, ["properties", "title"]) == sheetHistoryName, sheet.properties.sheetId, sheetHistoryId)}
+                                    - sheetPreviousDayId: ${if(map.get(sheet, ["properties", "title"]) == sheetPreviousDayName, sheet.properties.sheetId, sheetPreviousDayId)}
+                                    - sheetCurrentDayId: ${if(map.get(sheet, ["properties", "title"]) == sheetCurrentDayName, sheet.properties.sheetId, sheetCurrentDayId)}
+                
+                - initializeHistorySheets_checkSheetsExistence:
+                    # If one or more of the sheet ids was not found the workflow stops immediately 
+                    switch:
+                        - condition: ${sheetHiddenHistoryId == 0 or sheetHistoryId == 0 or sheetPreviousDayId == 0 or sheetCurrentDayId == 0}
+                          steps:
+                            - logEndWorkflow:
+                                call: sys.log
+                                args:
+                                    data: ${"Unable to proceed, one or more sheets (" + sheetHiddenHistoryName + ", " + sheetHistoryName + ", " + sheetPreviousDayName + ", " + sheetCurrentDayName + ") do not exist!"}
+                                    severity: "ERROR"
+                            - endWorkflow:
+                                return:
+
+                - initializeHistorySheets_logEnd:
+                    call: sys.log
+                    args:
+                        data: ${"Spreadsheet initialization complete"}
+                        severity: "INFO"
+
+        - getCurrencyPairs:
+            # Retrieve currency pairs from Firestore.
+            # Logs the number of currency pairs found or terminates the workflow if none are available.
+            steps:
+                - getCurrencyPairs_logInit:
+                    call: sys.log
+                    args:
+                        data: ${"Getting currency pairs from Firestore"}
+                        severity: "INFO"
+
+                - getCurrencyPairs_getPairs:
+                    call: googleapis.firestore.v1.projects.databases.documents.get
+                    args:
+                        name: ${firestoreBaseUrl + "/documents/configurations/wf-currency-exchange/currency-pairs"}
+                    result: currency_pairs
+                
+                - getCurrencyPairs_checkPairs:
+                    # Check if there is at least one currency pair to loop over
+                    switch:
+                        - condition: ${len(default(map.get(currency_pairs, ["documents"]), [])) == 0}
+                          steps:
+                            - getCurrencyPairs_checkPairs_logNoCurrencyPairs:
+                                call: sys.log
+                                args:
+                                    data: ${"No currency pairs in Firestore, terminating workflow"}
+                                    severity: "INFO"
+                            - getCurrencyPairs_checkPairs_end:
+                                return:
+                
+                - getCurrencyPairs_logEnd:
+                    call: sys.log
+                    args:
+                        data: ${"Found " + len(map.get(currency_pairs, ["documents"])) + " currency pairs in Firestore"}
+                        severity: "INFO"
+
+        - loopOverCurrencyPairs:
+            # Iterate over each currency pair and perform the following:
+            # - Validate the pair (e.g., ensure it has 6 characters, currencies are different).
+            # - Generate historical exchange rates for the pair using Google Sheets formulas.
+            # - Format the spreadsheet to ensure compatibility with BigQuery.
+            # - Trigger a Dataform workflow for further processing.
+            # - Update the status of the currency pair in Firestore.
+            for:
+                value: currency_pair
+                in: ${currency_pairs.documents}
+                steps:
+                    - extractPair:
+                        assign:
+                            - pair: ${text.split(currency_pair.name, "/")[len(text.split(currency_pair.name, "/")) - 1]}
+                            - data: ${map.get(currency_pair, ["fields"])}
+                    
+                    - checkPair:
+                        # Checking pair: 
+                        #   - if len(pair) != 6 skip to the next pair
+                        #   - if currency_from and currency_to are the same skip to the next pair
+                        #   - if the status is SUCCEEDED skip the history generation
+                        switch:
+                            - condition: ${len(pair) != 6}
+                              steps:
+                                - checkPair_logInvalidPair:
+                                    call: sys.log
+                                    args:
+                                        data: ${"Skipping pair " + pair + " since it does not contain 6 letters"}
+                                        severity: "WARNING"
+                              next: continue
+
+                            - condition: ${text.substring(pair, 0, 3) == text.substring(pair, 3, 6)}
+                              steps:
+                                - checkPair_logSameCurrencyFromAndCurrencyTo:
+                                    call: sys.log
+                                    args:
+                                        data: ${"Skipping currency pair " + pair + " since currency from and currency to are the same"}
+                                        severity: "WARNING"
+                              next: continue
+
+                            - condition: ${not fullRefresh and map.get(data, ["status", "stringValue"]) == "SUCCEEDED"}
+                              steps:
+                                - checkPair_logAlredyComputedHistory:
+                                    call: sys.log
+                                    args:
+                                        data: ${"Skipping history generation for currency pair " + pair + " since already computed in a previous run"}
+                                        severity: "INFO"
+                              next: createCurrentAndPreviousRatesValues
+
+                    - assignStartDate:
+                        # Assigning a defualt start date if not present for the pair
+                        assign:
+                            - startDate: ${default(map.get(data, ["startDate", "stringValue"]), defaultStartDate)}
+                    
+                    - currencyPairHistoryGeneration:
+                        steps:
+                            - currencyPairHistoryGeneration_logInit:
+                                call: sys.log
+                                args:
+                                    data: ${"Generating currency rates history for pair " + pair + " from " + startDate + " up to the current day"}
+                                    severity: "INFO"
+
+                            - currencyPairHistoryGeneration_insertDates:
+                                steps:
+                                    - insertDates_assignDatesFormula:
+                                        assign:
+                                            - datesFormula: ${"=QUERY(GOOGLEFINANCE(\"CURRENCY:" + pair + "\", \"price\", \"" + startDate + "\", TODAY(), \"DAILY\"), \"SELECT Col1 label Col1 'date'\")"}
+
+                                    - insertDates_insert:
+                                        call: googleapis.sheets.v4.spreadsheets.values.update
+                                        args:
+                                            spreadsheetId: ${spreadsheetId}
+                                            range: ${sheetHiddenHistoryName + "!A1"}
+                                            valueInputOption: USER_ENTERED
+                                            body:
+                                                values:
+                                                    - ${[datesFormula]}
+                            
+                            - currencyPairHistoryGeneration_insertRates:
+                                steps:
+                                    - currencyPairHistoryGeneration_insertRates_assignRatesFormula:
+                                        assign:
+                                            - ratesFormula: ${"=QUERY(GOOGLEFINANCE(\"CURRENCY:" + pair + "\", \"price\", \"" + startDate + "\", TODAY(), \"DAILY\"), \"SELECT Col2 label Col2 'rate'\")"}
+                            
+                                    - currencyPairHistoryGeneration_insertRates_insert:
+                                        call: googleapis.sheets.v4.spreadsheets.values.update
+                                        args:
+                                            spreadsheetId: ${spreadsheetId}
+                                            range: ${sheetHiddenHistoryName + "!D1"}
+                                            valueInputOption: USER_ENTERED
+                                            body:
+                                                values:
+                                                    - ${[ratesFormula]}
+                            
+                            - currencyPairHistoryGeneration_waitRates:
+                                call: sys.sleep
+                                args:
+                                    seconds: 10
+                            
+                            - currencyPairHistoryGeneration_insertCurrencyFrom:
+                                steps:
+                                    - currencyPairHistoryGeneration_insertCurrencyFrom_assignFormula:
+                                        assign:
+                                            - currencyFromFormula: ${"=ARRAYFORMULA(IF(A2:A<>\"\", \"" + text.substring(pair, 0, 3) + "\", \"\"))"}
+                                    
+                                    - currencyPairHistoryGeneration_insertCurrencyFrom_insert:
+                                        call: googleapis.sheets.v4.spreadsheets.values.update
+                                        args:
+                                            spreadsheetId: ${spreadsheetId}
+                                            range: ${sheetHiddenHistoryName + "!B2"}
+                                            valueInputOption: USER_ENTERED
+                                            body:
+                                                values: 
+                                                    - ${[currencyFromFormula]}
+                            
+                            - currencyPairHistoryGeneration_insertCurrencyTo:
+                                steps:
+                                    - insertCurrencyTo_assignFormula:
+                                        assign:
+                                            - currencyToFormula: ${"=ARRAYFORMULA(IF(A2:A<>\"\", \"" + text.substring(pair, 3, 6) + "\", \"\"))"}
+                                    
+                                    - insertCurrencyTo_insert:
+                                        call: googleapis.sheets.v4.spreadsheets.values.update
+                                        args:
+                                            spreadsheetId: ${spreadsheetId}
+                                            range: ${sheetHiddenHistoryName + "!C2"}
+                                            valueInputOption: USER_ENTERED
+                                            body:
+                                                values: 
+                                                    - ${[currencyToFormula]}
+
+                            - currencyPairHistoryGeneration_copySheet:
+                                call: googleapis.sheets.v4.spreadsheets.batchUpdate
+                                args:
+                                    spreadsheetId: ${spreadsheetId}
+                                    body:
+                                        requests:
+                                            - copyPaste:
+                                                source:
+                                                    sheetId: ${sheetHiddenHistoryId}
+                                                    startRowIndex: 0
+                                                    startColumnIndex: 0
+                                                destination:
+                                                    sheetId: ${sheetHistoryId}
+                                                    startRowIndex: 0
+                                                    startColumnIndex: 0
+                                                pasteType: "PASTE_VALUES"
+                            
+                            - currencyPairHistoryGeneration_formatSpreadsheetHistory:
+                                call: googleapis.sheets.v4.spreadsheets.batchUpdate
+                                args:
+                                    spreadsheetId: ${spreadsheetId}
+                                    body:
+                                        requests:
+                                            - repeatCell:
+                                                range:
+                                                    sheetId: ${sheetHistoryId}
+                                                    startRowIndex: 1
+                                                    startColumnIndex: 0
+                                                    endColumnIndex: 1
+                                                cell:
+                                                    userEnteredFormat:
+                                                        numberFormat:
+                                                            type: DATE
+                                                            pattern: "yyyy-MM-dd"
+                                                fields: "userEnteredFormat.numberFormat"
+                                            
+                                            - repeatCell:
+                                                range:
+                                                    sheetId: ${sheetHistoryId}
+                                                    startRowIndex: 1
+                                                    startColumnIndex: 3
+                                                    endColumnIndex: 4
+                                                cell:
+                                                    userEnteredFormat:
+                                                        numberFormat:
+                                                            type: NUMBER
+                                                            pattern: "0.0000000"
+                                                fields: "userEnteredFormat.numberFormat"
+
+                            - currencyPairHistoryGeneration_logEnd:
+                                call: sys.log
+                                args:
+                                    data: ${"Successfully generated currency exchange rates history for pair " + pair + " in spreadsheet"}
+                                    severity: "INFO"
+
+                    - triggerHistoryWorkflow:
+                        steps:
+                            - triggerHistoryWorkflow_logInit:
+                                call: sys.log
+                                args:
+                                    data: ${"Executing workflow for " + pair + " currency exchange rates history..."}
+                                    severity: "INFO"
+
+                            - triggerHistoryWorkflow_createWorkflowCompilation:
+                                try:
+                                    call: http.post
+                                    args:
+                                        url: ${dataformBaseUrl + dataformRepositoryUrl + "/compilationResults"}
+                                        auth:
+                                            type: OAuth2
+                                        body:
+                                            gitCommitish: main
+                                            codeCompilationConfig: 
+                                                vars: {
+                                                    spreadsheetId: "${spreadsheetId}"
+                                                }
+                                    result: compilationResult
+                                except:
+                                    as: e
+                                    raise: ${e}
+
+                            - triggerHistoryWorkflow_createWorkflowInvocation:
+                                call: http.post
+                                args:
+                                    url: ${dataformBaseUrl + dataformRepositoryUrl + "/workflowInvocations"}
+                                    auth:
+                                        type: OAuth2
+                                    body:
+                                        compilationResult: ${compilationResult.body.name}
+                                        invocationConfig:
+                                            includedTags:
+                                                - ${dataformWorkflowTag}
+                                            # fullyRefreshIncrementalTablesEnabled:
+                                result: workflowInvocation
+
+                            - triggerHistoryWorkflow_sleepExponentialBackoff:
+                                call: sys.sleep
+                                args:
+                                    seconds: 30
+
+                            - triggerHistoryWorkflow_getWorkflowStatus:
+                                call: http.get
+                                args:
+                                    url: ${dataformBaseUrl + workflowInvocation.body.name}
+                                    auth:
+                                        type: OAuth2
+                                result: dataform_status
+
+                            - triggerHistoryWorkflow_logWorkflowStatus:
+                                call: sys.log
+                                args:
+                                    data: ${"Workflow status of currency exchange rates history for pair " + pair + " is " + dataform_status.body.state}
+                                    severity: ${if(dataform_status.body.state == "FAILED", "ERROR", "INFO")}
+                            
+                            - triggerHistoryWorkflow_checkWorkflowStatus:
+                                switch:
+                                    - condition: ${dataform_status.body.state == "RUNNING"}
+                                      next: triggerHistoryWorkflow_sleepExponentialBackoff
+                            
+                            - triggerHistoryWorkflow_logEnd:
+                                call: sys.log
+                                args:
+                                    data: ${"Workflow execution for currency exchange rates history for pair " + pair + " ended with status " + dataform_status.body.state}
+                                    severity: ${if(dataform_status.body.state == "FAILED", "ERROR", "INFO")}
+
+                    - updateFirestoreCurrencyPair:
+                        steps:
+                            - updateFirestoreCurrencyPair_update:
+                                call: googleapis.firestore.v1.projects.databases.documents.patch
+                                args:
+                                    name: ${firestoreBaseUrl + "/documents/configurations/wf-currency-exchange/currency-pairs/" + pair}
+                                    updateMask:
+                                        fieldPaths: ["status"]
+                                    body:
+                                        fields:
+                                            status:
+                                                stringValue: ${dataform_status.body.state}
+                            
+                            - updateFirestoreCurrencyPair_log:
+                                call: sys.log
+                                args:
+                                    data: ${"Currency exchange rates history for pair " + pair + " updated with status " + dataform_status.body.state + " up to the current day"}
+                                    severity: "INFO"
+                    
+                    - createCurrentAndPreviousRatesValues:
+                        steps:
+                            - createCurrentAndPreviousRatesValues_assign:
+                                assign:
+                                    - previousRates: ${list.concat(previousRates, ["=INDEX(GOOGLEFINANCE(\"CURRENCY:" + pair + "\", \"close\", TODAY()-1),2,1)", text.substring(pair, 0, 3), text.substring(pair, 3, 6), "=ROUND(INDEX(GOOGLEFINANCE(\"CURRENCY:" + pair + "\", \"close\", TODAY()-1),2,2),7)"])}
+                                    - currentRates: ${list.concat(currentRates, ["=INDEX(GOOGLEFINANCE(\"CURRENCY:" + pair + "\", \"price\", TODAY()),2,1)", text.substring(pair, 0, 3), text.substring(pair, 3, 6), "=ROUND(INDEX(GOOGLEFINANCE(\"CURRENCY:" + pair + "\", \"price\", TODAY()),2,2),7)"])}
+
+                            - createCurrentAndPreviousRatesValues_log:
+                                call: sys.log
+                                args:
+                                    data: ${"Currency exchange rates values for pair " + pair + " generated for previous and current day"}
+                                    severity: "INFO"
+
+        - insertCurrentAndPreviuosRates:
+            # Insert the previous and current day's exchange rates into dedicated sheets.
+            # Clear existing data, insert headers, and format the sheets for proper data representation.
+            steps:
+                - insertCurrentAndPreviuosRates_clearPreviousDaySheet:
+                    call: googleapis.sheets.v4.spreadsheets.values.batchClear
+                    args:
+                        spreadsheetId: ${spreadsheetId}
+                        body:
+                            ranges: ${[sheetPreviousDayName + "!A:D"]}
+
+                - insertCurrentAndPreviuosRates_insertHeaderPreviousDay:
+                    call: googleapis.sheets.v4.spreadsheets.values.update
+                    args:
+                        spreadsheetId: ${spreadsheetId}
+                        range: ${sheetPreviousDayName + "!A1:D1"}
+                        valueInputOption: USER_ENTERED
+                        body:
+                            values:
+                                - ${["date", "currency_from", "currency_to", "rate"]}
+
+                - insertCurrentAndPreviuosRates_insertPreviuosDay:
+                    call: googleapis.sheets.v4.spreadsheets.values.append
+                    args:
+                        spreadsheetId: ${spreadsheetId}
+                        range: ${sheetPreviousDayName + "!A:D"}
+                        valueInputOption: USER_ENTERED
+                        insertDataOption: INSERT_ROWS
+                        body:
+                            values: ${previousRates}
+                            majorDimension: ROWS
+                        
+                - insertCurrentAndPreviuosRates_clearCurrentDaySheet:
+                    call: googleapis.sheets.v4.spreadsheets.values.batchClear
+                    args:
+                        spreadsheetId: ${spreadsheetId}
+                        body:
+                            ranges: ${[sheetCurrentDayName + "!A:D"]}
+
+                - insertCurrentAndPreviuosRates_insertHeaderCurrentDay:
+                    call: googleapis.sheets.v4.spreadsheets.values.update
+                    args:
+                        spreadsheetId: ${spreadsheetId}
+                        range: ${sheetCurrentDayName + "!A1:D1"}
+                        valueInputOption: USER_ENTERED
+                        body:
+                            values:
+                                - ${["date", "currency_from", "currency_to", "rate"]}
+
+                - insertCurrentAndPreviuosRates_insertCurrentDay:
+                    call: googleapis.sheets.v4.spreadsheets.values.append
+                    args:
+                        spreadsheetId: ${spreadsheetId}
+                        range: ${sheetCurrentDayName + "!A:D"}
+                        valueInputOption: USER_ENTERED
+                        insertDataOption: INSERT_ROWS
+                        body:
+                            values: ${currentRates}
+                            majorDimension: ROWS
+
+                - insertCurrentAndPreviuosRates_formatSheets:
+                    # Formatting sheets to comply with BigQuery types (dates in the format yyyy-mm-dd and numbers with at max 7 digit after point)
+                    steps:
+                        - insertCurrentAndPreviuosRates_formatSheets_previuosDay:
+                            call: googleapis.sheets.v4.spreadsheets.batchUpdate
+                            args:
+                                spreadsheetId: ${spreadsheetId}
+                                body:
+                                    requests:
+                                        - repeatCell:
+                                            range:
+                                                sheetId: ${sheetPreviousDayId}
+                                                startRowIndex: 0
+                                                startColumnIndex: 0
+                                                endColumnIndex: 1
+                                            cell:
+                                                userEnteredFormat:
+                                                    numberFormat:
+                                                        type: DATE
+                                                        pattern: "yyyy-MM-dd"
+                                            fields: "userEnteredFormat.numberFormat"
+
+                                        - repeatCell:
+                                            range:
+                                                sheetId: ${sheetPreviousDayId}
+                                                startRowIndex: 1
+                                                startColumnIndex: 3
+                                                endColumnIndex: 4
+                                            cell:
+                                                userEnteredFormat:
+                                                    numberFormat:
+                                                        type: NUMBER
+                                                        pattern: "0.0000000"
+                                            fields: "userEnteredFormat.numberFormat"
+                                    
+                        - insertCurrentAndPreviuosRates_formatSheets_currentDay:
+                            call: googleapis.sheets.v4.spreadsheets.batchUpdate
+                            args:
+                                spreadsheetId: ${spreadsheetId}
+                                body:
+                                    requests:
+                                        - repeatCell:
+                                            range:
+                                                sheetId: ${sheetCurrentDayId}
+                                                startRowIndex: 0
+                                                startColumnIndex: 0
+                                                endColumnIndex: 1
+                                            cell:
+                                                userEnteredFormat:
+                                                    numberFormat:
+                                                        type: DATE
+                                                        pattern: "yyyy-MM-dd"
+                                            fields: "userEnteredFormat.numberFormat"
+                                        
+                                        - repeatCell:
+                                            range:
+                                                sheetId: ${sheetCurrentDayId}
+                                                startRowIndex: 1
+                                                startColumnIndex: 3
+                                                endColumnIndex: 4
+                                            cell:
+                                                userEnteredFormat:
+                                                    numberFormat:
+                                                        type: NUMBER
+                                                        pattern: "0.0000000"
+                                            fields: "userEnteredFormat.numberFormat"
+                
+                - insertCurrentAndPreviuosRates_log:
+                    call: sys.log
+                    args:
+                        data: ${"Currency exchange rates inserted in previous and current day sheets"}
+                        severity: "INFO"
+
+        - clearHistorySheets:
+            # Clear the history sheets to remove temporary data used during the workflow execution.
+            steps:
+                - clearHistorySheets_clear:
+                    call: googleapis.sheets.v4.spreadsheets.values.batchClear
+                    args:
+                        spreadsheetId: ${spreadsheetId}
+                        body:
+                            ranges: ${[sheetHiddenHistoryName + "!A:D", sheetHistoryName + "!A:D"]}
+
+                - clearHistorySheets_log:
+                    call: sys.log
+                    args:
+                        data: ${"Successfully cleared history sheets!"}
+                        severity: "INFO" 
+
+        - triggerDailyWorkflow:
+            # Trigger a Dataform workflow for daily currency exchange rate updates.
+            # Logs the workflow status and retries if it is still running.
+            steps:
+                - triggerDailyWorkflow_logInit:
+                    call: sys.log
+                    args:
+                        data: ${"Executing workflow for currency rates daily..."}
+                        severity: "INFO"
+
+                - triggerDailyWorkflow_createWorkflowCompilation:
+                    try:
+                        call: http.post
+                        args:
+                            url: ${dataformBaseUrl + dataformRepositoryUrl + "/compilationResults"}
+                            auth:
+                                type: OAuth2
+                            body:
+                                gitCommitish: main
+                                codeCompilationConfig: 
+                                    vars: {
+                                        spreadsheetId: "${spreadsheetId}"
+                                    }
+                        result: compilationResult
+                    except:
+                        as: e
+                        raise: ${e}
+
+                - triggerDailyWorkflow_createWorkflowInvocation:
+                    call: http.post
+                    args:
+                        url: ${dataformBaseUrl + dataformRepositoryUrl + "/workflowInvocations"}
+                        auth:
+                            type: OAuth2
+                        body:
+                            compilationResult: ${compilationResult.body.name}
+                            invocationConfig:
+                                includedTags:
+                                    - ${dataformWorkflowTag}
+                    result: workflowInvocation
+
+                - triggerDailyWorkflow_sleepExponentialBackoff:
+                    call: sys.sleep
+                    args:
+                        seconds: 30
+
+                - triggerDailyWorkflow_getWorkflowStatus:
+                    call: http.get
+                    args:
+                        url: ${dataformBaseUrl + workflowInvocation.body.name}
+                        auth:
+                            type: OAuth2
+                    result: dataform_status
+
+                - triggerDailyWorkflow_logWorkflowStatus:
+                    call: sys.log
+                    args:
+                        data: ${"Workflow status for currency exchange daily is " + dataform_status.body.state}
+                        severity: ${if(dataform_status.body.state == "FAILED", "ERROR", "INFO")}
+                
+                - triggerDailyWorkflow_checkWorkflowStatus:
+                    switch:
+                        - condition: ${dataform_status.body.state == "RUNNING"}
+                          next: triggerDailyWorkflow_sleepExponentialBackoff  
+                
+                - triggerDailyWorkflow_logEnd:
+                    call: sys.log
+                    args:
+                        data: ${"Workflow execution for daily currency exchange rates ended with status " + dataform_status.body.state}
+                        severity: ${if(dataform_status.body.state == "FAILED", "ERROR", "INFO")}

@@ -1,0 +1,42 @@
+config {
+  type: "operations",
+  disabled: false,
+  hasOutput: true,
+  dependencies: [],
+  tags: ["user-defined-objects", "currency-exchange"],
+  schema: "commons",
+  name: "udf_convert_currency"
+}
+
+CREATE OR REPLACE FUNCTION ${self()} (
+    input_date DATE,
+    convert_from STRING,
+    convert_to STRING,
+    input_value ANY TYPE
+) RETURNS NUMERIC AS (
+    CASE 
+        WHEN UPPER(convert_from) = UPPER(convert_to) 
+          THEN SAFE_CAST(input_value AS NUMERIC)
+        ELSE COALESCE(
+          (
+            SELECT SAFE_MULTIPLY(SAFE_CAST(input_value AS NUMERIC), rate)
+            FROM ${ref('commons', 'currency_exchange')} AS exc
+            WHERE 1=1
+              AND exc.date = DATE(input_date)
+              AND exc.currency_from = UPPER(convert_from) 
+              AND exc.currency_to = UPPER(convert_to)
+            LIMIT 1
+          ),
+          (
+            SELECT SAFE_DIVIDE(SAFE_CAST(input_value AS NUMERIC), rate)
+            FROM ${ref('commons', 'currency_exchange')} AS exc
+            WHERE 1=1
+              AND exc.date = DATE(input_date)
+              AND exc.currency_from = UPPER(convert_to)
+              AND exc.currency_to = UPPER(convert_from)
+            LIMIT 1
+          ),
+          NULL
+        )
+    END
+);
